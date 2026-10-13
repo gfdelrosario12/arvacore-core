@@ -21,6 +21,16 @@ This directory contains the central domain model and decision engine for **ArvaC
 2. **`test_arvacore_engine.py`**:
    - Comprehensive test suite validating AWD transitions, sensor bound rejections, still-well geometry, and flow anomalies.
 
+3. **`sketch_pump_controller/sketch_pump_controller.ino`**:
+   - ESP32 central pump and solenoid valve actuation controller.
+   - Active-LOW relay pin assignments:
+     - Pump Relay: `GPIO 26`
+     - Solenoid Valve Relay: `GPIO 27`
+     - Hall-Effect Flow Sensor: `GPIO 4` (Interrupt pulse counter)
+     - Heartbeat / Status LED: `GPIO 2`
+   - Connects to deployed backend (`https://api-aquaflow.gladwindr.me/api/v1`) with gateway key authentication.
+   - Enforces closed-loop flow delivery verification, dry-run safety shutoff, and maximum runtime timeout guards.
+
 ## Running Tests
 ```bash
 python3 -m unittest test_arvacore_engine.py

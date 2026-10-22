@@ -5,7 +5,7 @@
 
 // ============================================================
 // ARVACORE - ESP32 CENTRAL PUMP & ACTUATION CONTROLLER
-// Thesis: Alternate Wetting and Drying (AWD) Monitoring
+// Alternate Wetting and Drying (AWD) Monitoring Subsystem
 //
 // Hardware Assignments:
 //   RELAY_PUMP_PIN      -> GPIO 26 (Main Irrigation Pump Relay)
@@ -13,14 +13,13 @@
 //   FLOW_SENSOR_PIN     -> GPIO 4  (YF-S201 Hall-Effect Flow Sensor Pulse In)
 //   STATUS_LED_PIN      -> GPIO 2  (Built-in LED / Operational Heartbeat)
 //
-// Relays are typically ACTIVE LOW (LOW = ON / Energized, HIGH = OFF)
+// Relays are ACTIVE LOW (LOW = ON / Energized, HIGH = OFF)
 // ============================================================
 
 // -------------------- CONTROLLER CONFIGURATION ---------------
 const char* CONTROLLER_ID = "CTRL-FIELD-01";
 
 // Backend API endpoint for command polling and actuation telemetry uplink
-// Backend host: api-aquaflow.gladwindr.me
 const char* BACKEND_BASE = "https://api-aquaflow.gladwindr.me/api/v1";
 const char* GATEWAY_KEY = "ed630e681ef735f36954469b48f832f210286246ca95fff62e62086cab74e8a9";
 
@@ -59,6 +58,7 @@ unsigned long pumpStartTime = 0;
 unsigned long lastPollTime = 0;
 unsigned long lastTelemetryTime = 0;
 String activeCorrelationId = "";
+String lastExecutedCorrelationId = "";
 
 // ------------------------------------------------------------
 // Flow Sensor ISR
@@ -74,27 +74,25 @@ void updateFlowRate() {
   unsigned long now = millis();
   unsigned long elapsed = now - lastPulseCalcTime;
   if (elapsed >= 1000) {
-    // Disable interrupts briefly while reading pulse count
     noInterrupts();
     unsigned long pulses = flowPulseCount;
     flowPulseCount = 0;
     interrupts();
 
-    // Flow rate in L/min = (pulses / elapsed_seconds) / 7.5
     float elapsedSec = elapsed / 1000.0f;
     currentFlowRateLpm = (pulses / elapsedSec) / FLOW_CALIBRATION_FACTOR;
-
-    // Accumulate total volume
     totalLitersDelivered += (currentFlowRateLpm / 60.0f) * elapsedSec;
-
     lastPulseCalcTime = now;
   }
 }
 
+// Forward declaration
+void sendCommandAck(const String &correlationId, const String &status, const String &action, const String &reason);
+
 // ------------------------------------------------------------
 // Relay Actuation Control
 // ------------------------------------------------------------
-void setPumpState(bool activate, const String &correlationId = "") {
+void setPumpState(bool activate, const String &correlationId = "", const String &actionName = "IRRIGATION") {
   if (activate) {
     digitalWrite(RELAY_VALVE_PIN, RELAY_ON); // Open valve first
     delay(200);
@@ -104,7 +102,10 @@ void setPumpState(bool activate, const String &correlationId = "") {
     isValveOpen = true;
     pumpStartTime = millis();
     activeCorrelationId = correlationId;
-    Serial.printf("[RELAY] PUMP ACTIVATED (Valve OPEN) | CorrId: %s\n", correlationId.c_str());
+    Serial.printf("[ARVACORE] Signal received & executed: PUMP ON (Valve OPEN) | CorrId: %s\n", correlationId.c_str());
+    if (correlationId.length() > 0) {
+      sendCommandAck(correlationId, "EXECUTED", actionName, "Pump and valve engaged successfully");
+    }
   } else {
     digitalWrite(RELAY_PUMP_PIN, RELAY_OFF); // Cut pump first
     delay(200);
@@ -113,8 +114,11 @@ void setPumpState(bool activate, const String &correlationId = "") {
     isPumpActive = false;
     isValveOpen = false;
     pumpStartTime = 0;
+    Serial.printf("[ARVACORE] Signal executed: PUMP OFF (Valve CLOSED) | CorrId: %s\n", correlationId.c_str());
+    if (correlationId.length() > 0) {
+      sendCommandAck(correlationId, "EXECUTED", actionName, "Pump and valve disengaged successfully");
+    }
     activeCorrelationId = "";
-    Serial.println(F("[RELAY] PUMP HALTED (Valve CLOSED)"));
   }
 }
 
@@ -127,22 +131,59 @@ void connectWiFi() {
   Serial.printf("[WIFI] Connecting to SSID: %s\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 15) {
     delay(500);
     Serial.print(F("."));
-    attempts++;
+    retries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("\n[WIFI] Connected! IP: %s | RSSI: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
   } else {
-    Serial.println(F("\n[WIFI] Timeout connecting to Wi-Fi."));
+    Serial.println(F("\n[WIFI] Connection timeout. Retrying on next loop."));
   }
 }
 
 // ------------------------------------------------------------
-// Uplink Actuator & Flow Telemetry to Backend
+// Send Command Acknowledgment to Backend
+// ------------------------------------------------------------
+void sendCommandAck(const String &correlationId, const String &status, const String &action, const String &reason) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+  String url = String(BACKEND_BASE) + "/irrigation/ack/" + correlationId;
+  if (!http.begin(client, url)) return;
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-ArvaCore-Gateway-Key", GATEWAY_KEY);
+
+  String json = "{";
+  json += "\"controllerId\":\"" + String(CONTROLLER_ID) + "\",";
+  json += "\"status\":\"" + status + "\",";
+  json += "\"action\":\"" + action + "\",";
+  json += "\"reason\":\"" + reason + "\",";
+  json += "\"currentFlowRateLpm\":" + String(currentFlowRateLpm, 2) + ",";
+  json += "\"totalLiters\":" + String(totalLitersDelivered, 2) + ",";
+  json += "\"pumpActive\":" + String(isPumpActive ? "true" : "false") + ",";
+  json += "\"valveOpen\":" + String(isValveOpen ? "true" : "false");
+  json += "}";
+
+  int httpCode = http.POST(json);
+  if (httpCode > 0) {
+    Serial.printf("[ARVACORE-ACK] Sent status %s for CorrId %s | Code: %d\n", status.c_str(), correlationId.c_str(), httpCode);
+  } else {
+    Serial.printf("[ARVACORE-ACK] Failed sending ACK: %s\n", http.errorToString(httpCode).c_str());
+  }
+  http.end();
+}
+
+// ------------------------------------------------------------
+// Uplink Actuator Telemetry to Backend
 // ------------------------------------------------------------
 void uplinkActuatorTelemetry() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -160,8 +201,6 @@ void uplinkActuatorTelemetry() {
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-ArvaCore-Gateway-Key", GATEWAY_KEY);
 
-  // Construct JSON compliant with backend TelemetryUplinkRequest
-  // Includes pumpStatus and flowRate for frontend reflection
   String json = "{";
   json += "\"nodeId\":\"" + String(CONTROLLER_ID) + "\",";
   json += "\"pumpStatus\":\"" + String(isPumpActive ? "pumping" : "off") + "\",";
@@ -183,6 +222,17 @@ void uplinkActuatorTelemetry() {
   http.end();
 }
 
+// Helper to extract JSON string property
+String extractJsonField(const String &json, const String &fieldName) {
+  int keyIndex = json.indexOf("\"" + fieldName + "\":");
+  if (keyIndex < 0) return "";
+  int valStart = keyIndex + fieldName.length() + 3;
+  while (valStart < json.length() && (json[valStart] == ' ' || json[valStart] == '\"')) valStart++;
+  int valEnd = valStart;
+  while (valEnd < json.length() && json[valEnd] != '\"' && json[valEnd] != ',' && json[valEnd] != '}') valEnd++;
+  return json.substring(valStart, valEnd);
+}
+
 // ------------------------------------------------------------
 // Poll Backend for Irrigation Commands
 // ------------------------------------------------------------
@@ -196,7 +246,7 @@ void pollIrrigationCommands() {
   client.setInsecure();
 
   HTTPClient http;
-  String url = String(BACKEND_BASE) + "/devices/" + String(CONTROLLER_ID);
+  String url = String(BACKEND_BASE) + "/irrigation/pending-command/" + String(CONTROLLER_ID);
   if (!http.begin(client, url)) return;
 
   http.addHeader("Accept", "application/json");
@@ -205,16 +255,32 @@ void pollIrrigationCommands() {
   int httpCode = http.GET();
   if (httpCode == 200) {
     String payload = http.getString();
-    // Simple JSON inspection for emergency stop or manual start/stop commands
-    if (payload.indexOf("\"STOP\"") >= 0 || payload.indexOf("\"EMERGENCY_STOP\"") >= 0 || payload.indexOf("\"OFF\"") >= 0) {
-      if (isPumpActive) {
-        Serial.println(F("[COMMAND] Received STOP / E-STOP command from Backend"));
-        setPumpState(false);
+    String correlationId = extractJsonField(payload, "correlationId");
+    String command = extractJsonField(payload, "command");
+
+    if (correlationId.length() > 0 && command.length() > 0) {
+      if (correlationId == lastExecutedCorrelationId) {
+        // Prevent duplicate execution
+        http.end();
+        return;
       }
-    } else if (payload.indexOf("\"MANUAL_START\"") >= 0 || payload.indexOf("\"REFLOOD\"") >= 0 || payload.indexOf("\"ON\"") >= 0) {
-      if (!isPumpActive) {
-        Serial.println(F("[COMMAND] Received START / REFLOOD command from Backend"));
-        setPumpState(true);
+
+      Serial.printf("[ARVACORE] New command received: %s | CorrId: %s\n", command.c_str(), correlationId.c_str());
+      lastExecutedCorrelationId = correlationId;
+
+      // Send initial RECEIVED acknowledgment
+      sendCommandAck(correlationId, "RECEIVED", command, "Command received by controller");
+
+      if (command.equalsIgnoreCase("STOP_IRRIGATION") || command.equalsIgnoreCase("SAFE_STOP") ||
+          command.equalsIgnoreCase("EMERGENCY_STOP") || command.equalsIgnoreCase("MANUAL_STOP")) {
+        setPumpState(false, correlationId, command);
+      } else if (command.equalsIgnoreCase("START_IRRIGATION") || command.equalsIgnoreCase("MANUAL_START") ||
+                 command.equalsIgnoreCase("REFLOOD")) {
+        setPumpState(true, correlationId, command);
+      } else if (command.equalsIgnoreCase("STATUS_REQUEST")) {
+        sendCommandAck(correlationId, "EXECUTED", command, "Current state reported");
+      } else {
+        sendCommandAck(correlationId, "REJECTED", command, "Unknown command type");
       }
     }
   }
@@ -269,14 +335,14 @@ void loop() {
   // 2. Hardware Safety Interlock: Timeout guard for pump
   if (isPumpActive && (now - pumpStartTime >= MAX_PUMP_RUNTIME_MS)) {
     Serial.println(F("[SAFETY INTERLOCK] Max single pulse runtime exceeded. Emergency shutoff."));
-    setPumpState(false);
+    setPumpState(false, activeCorrelationId, "SAFETY_TIMEOUT");
   }
 
   // 3. Dry-Run Protection: If pump is ON for >15s but flow rate < 5 L/min
   if (isPumpActive && (now - pumpStartTime > 15000UL) && (currentFlowRateLpm < MIN_VERIFIED_FLOW_LPM)) {
     Serial.printf("[FLOW VERIFICATION FAULT] Pump ON but flow rate only %.1f L/min (< %.1f L/min). Halting pump.\n",
                   currentFlowRateLpm, MIN_VERIFIED_FLOW_LPM);
-    setPumpState(false);
+    setPumpState(false, activeCorrelationId, "DRY_RUN_PROTECTION");
   }
 
   // 4. Poll Backend for Commands
@@ -291,4 +357,3 @@ void loop() {
     uplinkActuatorTelemetry();
   }
 }
-
